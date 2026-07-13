@@ -1,0 +1,278 @@
+name: Update README
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/github-script@v7
+        env:
+          HAS_PRIVATE_TOKEN: ${{ secrets.README_STATS_TOKEN != '' }}
+          LOGIN: shlokrj
+          TIME_ZONE: America/Los_Angeles
+        with:
+          github-token: ${{ secrets.README_STATS_TOKEN || github.token }}
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const login = process.env.LOGIN;
+            const timeZone = process.env.TIME_ZONE;
+            const hasPrivateToken = process.env.HAS_PRIVATE_TOKEN === "true";
+            const dayMs = 24 * 60 * 60 * 1000;
+
+            const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+            const toDate = (value) => new Date(`${value}T00:00:00Z`);
+            const formatDate = (date) => date.toISOString().slice(0, 10);
+            const addDays = (date, days) => new Date(date.getTime() + days * dayMs);
+            const minDate = (a, b) => (a < b ? a : b);
+
+            const localToday = () => {
+              const parts = new Intl.DateTimeFormat("en-CA", {
+                timeZone,
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit",
+              }).formatToParts(new Date());
+
+              const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+              return `${values.year}-${values.month}-${values.day}`;
+            };
+
+            const dateTimeRange = (start, end) => ({
+              from: `${formatDate(start)}T00:00:00Z`,
+              to: `${formatDate(end)}T23:59:59Z`,
+            });
+
+            const { user } = await github.graphql(
+              `
+                query($login: String!) {
+                  user(login: $login) {
+                    createdAt
+                  }
+                }
+              `,
+              { login },
+            );
+
+            const startDate = toDate(user.createdAt.slice(0, 10));
+            const today = toDate(localToday());
+            const contributionCounts = new Map();
+
+            for (let chunkStart = startDate; chunkStart <= today; chunkStart = addDays(chunkStart, 366)) {
+              const chunkEnd = minDate(addDays(chunkStart, 365), today);
+              const range = dateTimeRange(chunkStart, chunkEnd);
+              const data = await github.graphql(
+                `
+                  query($login: String!, $from: DateTime!, $to: DateTime!) {
+                    user(login: $login) {
+                      contributionsCollection(from: $from, to: $to) {
+                        contributionCalendar {
+                          weeks {
+                            contributionDays {
+                              date
+                              contributionCount
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                `,
+                { login, ...range },
+              );
+
+              for (const week of data.user.contributionsCollection.contributionCalendar.weeks) {
+                for (const day of week.contributionDays) {
+                  contributionCounts.set(day.date, day.contributionCount);
+                }
+              }
+            }
+
+            const contributionsOn = (date) => contributionCounts.get(formatDate(date)) ?? 0;
+            let streakEnd = today;
+
+            if (contributionsOn(streakEnd) === 0) {
+              const yesterday = addDays(today, -1);
+              streakEnd = contributionsOn(yesterday) > 0 ? yesterday : null;
+            }
+
+            let streakDays = 0;
+            let streakStart = null;
+
+            if (streakEnd) {
+              for (let cursor = streakEnd; contributionsOn(cursor) > 0; cursor = addDays(cursor, -1)) {
+                streakStart = cursor;
+                streakDays += 1;
+              }
+            }
+
+            const publicCommitCount = async () => {
+              if (streakDays === 0) {
+                return 0;
+              }
+
+              let count = 0;
+
+              for (let chunkStart = streakStart; chunkStart <= streakEnd; chunkStart = addDays(chunkStart, 366)) {
+                const chunkEnd = minDate(addDays(chunkStart, 365), streakEnd);
+                const range = dateTimeRange(chunkStart, chunkEnd);
+                const data = await github.graphql(
+                  `
+                    query($login: String!, $from: DateTime!, $to: DateTime!) {
+                      user(login: $login) {
+                        contributionsCollection(from: $from, to: $to) {
+                          totalCommitContributions
+                        }
+                      }
+                    }
+                  `,
+                  { login, ...range },
+                );
+
+                count += data.user.contributionsCollection.totalCommitContributions;
+              }
+
+              return count;
+            };
+
+            const restrictedContributionCount = async () => {
+              if (streakDays === 0 || hasPrivateToken) {
+                return 0;
+              }
+
+              let count = 0;
+
+              for (let chunkStart = streakStart; chunkStart <= streakEnd; chunkStart = addDays(chunkStart, 366)) {
+                const chunkEnd = minDate(addDays(chunkStart, 365), streakEnd);
+                const range = dateTimeRange(chunkStart, chunkEnd);
+                const data = await github.graphql(
+                  `
+                    query($login: String!, $from: DateTime!, $to: DateTime!) {
+                      user(login: $login) {
+                        contributionsCollection(from: $from, to: $to) {
+                          restrictedContributionsCount
+                        }
+                      }
+                    }
+                  `,
+                  { login, ...range },
+                );
+
+                count += data.user.contributionsCollection.restrictedContributionsCount;
+              }
+
+              return count;
+            };
+
+            const privateRepositories = async () => {
+              const repos = [];
+              let after = null;
+
+              do {
+                const data = await github.graphql(
+                  `
+                    query($after: String) {
+                      viewer {
+                        repositories(
+                          first: 100
+                          after: $after
+                          privacy: PRIVATE
+                          affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
+                          orderBy: { field: PUSHED_AT, direction: DESC }
+                        ) {
+                          nodes {
+                            nameWithOwner
+                            pushedAt
+                            defaultBranchRef {
+                              name
+                            }
+                          }
+                          pageInfo {
+                            hasNextPage
+                            endCursor
+                          }
+                        }
+                      }
+                    }
+                  `,
+                  { after },
+                );
+
+                repos.push(...data.viewer.repositories.nodes);
+                after = data.viewer.repositories.pageInfo.hasNextPage
+                  ? data.viewer.repositories.pageInfo.endCursor
+                  : null;
+              } while (after);
+
+              return repos;
+            };
+
+            const privateCommitCount = async () => {
+              if (streakDays === 0 || !hasPrivateToken) {
+                return 0;
+              }
+
+              let count = 0;
+              const range = dateTimeRange(streakStart, streakEnd);
+
+              for (const repo of await privateRepositories()) {
+                if (!repo.defaultBranchRef || new Date(repo.pushedAt) < streakStart) {
+                  continue;
+                }
+
+                const [owner, name] = repo.nameWithOwner.split("/");
+
+                try {
+                  const commits = await github.paginate(github.rest.repos.listCommits, {
+                    owner,
+                    repo: name,
+                    author: login,
+                    sha: repo.defaultBranchRef.name,
+                    since: range.from,
+                    until: range.to,
+                    per_page: 100,
+                  });
+
+                  count += commits.length;
+                } catch (error) {
+                  core.warning(`Could not read private commits for ${repo.nameWithOwner}: ${error.message}`);
+                }
+              }
+
+              return count;
+            };
+
+            const commitCount =
+              (await publicCommitCount()) + (await privateCommitCount()) + (await restrictedContributionCount());
+            const readmePath = path.join(process.env.GITHUB_WORKSPACE, "README.md");
+            const readme = fs.readFileSync(readmePath, "utf8");
+            const marker = /<!-- streak:start -->.*<!-- streak:end -->/;
+            const streakText = `${streakDays}-day streak`;
+            const stats = `<!-- streak:start -->${streakText} · ${plural(commitCount, "commit")}<!-- streak:end -->`;
+
+            if (!marker.test(readme)) {
+              core.setFailed("Could not find the streak marker in README.md.");
+              return;
+            }
+
+            fs.writeFileSync(readmePath, readme.replace(marker, stats));
+
+      - name: Commit README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if ! git diff --staged --quiet; then
+            git commit -m "Update README streak"
+            git push
+          fi
