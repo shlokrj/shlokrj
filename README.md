@@ -1,4 +1,4 @@
 <h3 align="center">
   <a href="https://shlok.fyi">shlok.fyi</a><br>
-  <sub><!-- streak:start -->66-day streak<!-- streak:end --></sub>
+  <sub><!-- streak:start -->67-day streak<!-- streak:end --></sub>
 </h3>
